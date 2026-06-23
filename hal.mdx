@@ -1,0 +1,180 @@
+---
+id: hal
+title: HAL Interface & Register Primitives
+sidebar_label: HAL & Primitives
+sidebar_position: 2
+---
+
+# HAL Interface & Register Primitives
+
+All I²C transactions in the nPZ2100 driver go through a thin HAL layer defined in
+[`npz2100_hal.h`](../include/npz2100_hal.h).
+
+---
+
+## Types
+
+### `npz2100_err_t`
+
+```c
+typedef enum {
+    NPZ2100_OK          =  0,
+    NPZ2100_ERR_IO      = -1,
+    NPZ2100_ERR_ARG     = -2,
+    NPZ2100_ERR_DEV     = -3,
+    NPZ2100_ERR_TIMEOUT = -4,
+    NPZ2100_ERR_STATE   = -5,
+} npz2100_err_t;
+```
+
+Return type of every API function. Negative values indicate failure.
+
+---
+
+### `npz2100_hal_t`
+
+```c
+typedef struct {
+    npz2100_i2c_write_fn write;      /* Platform I²C write callback */
+    npz2100_i2c_read_fn  read;       /* Platform I²C read callback  */
+    uint8_t              i2c_addr;   /* 7-bit device address         */
+    void                *ctx;        /* Optional user context        */
+} npz2100_hal_t;
+```
+
+Populate once at startup; pass a pointer to every API call.
+
+#### `write` callback contract
+
+```c
+typedef npz2100_err_t (*npz2100_i2c_write_fn)(
+    uint8_t        i2c_addr,   /* 7-bit address                       */
+    const uint8_t *buf,        /* buf[0] = reg addr, buf[1..] = data  */
+    size_t         len,        /* total bytes including reg addr       */
+    void          *ctx);
+```
+
+Issue **one** I²C transaction: `START | addr+W | buf[0] | buf[1] … | STOP`.
+
+#### `read` callback contract
+
+```c
+typedef npz2100_err_t (*npz2100_i2c_read_fn)(
+    uint8_t  i2c_addr,  /* 7-bit address              */
+    uint8_t  reg,       /* register to read from       */
+    uint8_t *buf,       /* destination buffer           */
+    size_t   len,       /* bytes to read                */
+    void    *ctx);
+```
+
+Issue: `START | addr+W | reg | rSTART | addr+R | buf[0..len-1] | STOP`.
+
+---
+
+## Register Primitive Functions
+
+Declared in `npz2100_hal.h`, implemented in `npz2100.c`.
+
+### `npz2100_reg_write`
+
+```c
+npz2100_err_t npz2100_reg_write(const npz2100_hal_t *hal,
+                                 uint8_t              reg,
+                                 uint8_t              value);
+```
+
+Write a single register byte. Issues **one** I²C transaction.
+
+---
+
+### `npz2100_reg_read`
+
+```c
+npz2100_err_t npz2100_reg_read(const npz2100_hal_t *hal,
+                                uint8_t              reg,
+                                uint8_t             *value);
+```
+
+Read a single register byte.
+
+---
+
+### `npz2100_reg_burst_write`
+
+```c
+npz2100_err_t npz2100_reg_burst_write(const npz2100_hal_t *hal,
+                                       uint8_t              start_reg,
+                                       const uint8_t       *data,
+                                       size_t               len);
+```
+
+Write `len` bytes to consecutive registers starting at `start_reg`, using **one** I²C transaction.
+Maximum `len` is 256 (covers the full SRAM window). Stack usage is `len + 1` bytes.
+
+:::tip Energy note
+Use burst writes whenever you need to configure multiple consecutive registers — for example,
+writing GCT (5 bytes: `0x10–0x14`) or a SRAM initialisation sequence.  This cuts bus-active
+time proportionally to the number of registers updated.
+:::
+
+---
+
+### `npz2100_reg_burst_read`
+
+```c
+npz2100_err_t npz2100_reg_burst_read(const npz2100_hal_t *hal,
+                                      uint8_t              start_reg,
+                                      uint8_t             *data,
+                                      size_t               len);
+```
+
+Read `len` bytes from consecutive registers starting at `start_reg`.
+
+---
+
+### `npz2100_reg_rmw`
+
+```c
+npz2100_err_t npz2100_reg_rmw(const npz2100_hal_t *hal,
+                                uint8_t              reg,
+                                uint8_t              mask,
+                                uint8_t              value);
+```
+
+Read-modify-write: reads the register, clears `mask` bits, ORs in `value & mask`, writes back.
+Costs **2** I²C transactions. When updating multiple fields in the same register, compute the
+full byte yourself and call `npz2100_reg_write()` instead.
+
+**Example — enable peripheral 1 and 3 as wake-up sources, leave others unchanged:**
+
+```c
+uint8_t mask = NPZ2100_SYSCFG1_WUP_Pn_MSK(1) | NPZ2100_SYSCFG1_WUP_Pn_MSK(3);
+uint8_t val  = NPZ2100_SYSCFG1_WUP_Pn_MSK(1) | NPZ2100_SYSCFG1_WUP_Pn_MSK(3);
+npz2100_reg_rmw(&hal, NPZ2100_REG_SYSCFG1, mask, val);
+```
+
+---
+
+## Bitfield Macro Conventions
+
+Each register header follows a consistent naming scheme:
+
+| Macro pattern | Meaning |
+|---|---|
+| `NPZ2100_REG_<NAME>` | Register address (`uint8_t`) |
+| `NPZ2100_<REG>_<FIELD>_MSK` | Bitmask for the field |
+| `NPZ2100_<REG>_<FIELD>_POS` | LSB position (for shifting) |
+| `NPZ2100_<REG>_<FIELD>(v)` | Encode value into field position |
+| `NPZ2100_<REG>_<FIELD>_GET(r)` | Extract field from raw register byte `r` |
+
+**Example — read the system reset source from STA1:**
+
+```c
+uint8_t sta1;
+npz2100_reg_read(&hal, NPZ2100_REG_STA1, &sta1);
+uint8_t rst = NPZ2100_STA1_RST_SRC_GET(sta1);
+
+if (rst == NPZ2100_RST_SRC_BOR) {
+    /* Brown-out reset occurred */
+}
+```

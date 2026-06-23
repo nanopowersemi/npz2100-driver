@@ -1,0 +1,348 @@
+---
+id: registers
+title: Register Reference
+sidebar_label: Registers
+sidebar_position: 3
+---
+
+# Register Reference
+
+All register addresses and bitfield macros are defined across four headers.
+Include `npz2100.h` to pull them all in, or include individual headers as needed.
+
+---
+
+## System / Global Block — `npz2100_regs_system.h`
+
+### IDLE_RST — `0x00` (R/W)
+
+Writes a magic value to enter idle mode or trigger a reset. Always reads `0x00`.
+
+```c
+/* Enter idle — nPZ2100 takes over; host MCU can now power off */
+npz2100_reg_write(&hal, NPZ2100_REG_IDLE_RST, NPZ2100_IDLE_RST_ENTER_IDLE); /* 0xFF */
+
+/* Soft reset (preserves SRAM content) */
+npz2100_reg_write(&hal, NPZ2100_REG_IDLE_RST, NPZ2100_IDLE_RST_SOFT_RESET); /* 0xA5 */
+
+/* Full system reset */
+npz2100_reg_write(&hal, NPZ2100_REG_IDLE_RST, NPZ2100_IDLE_RST_SYS_RESET);  /* 0x5A */
+```
+
+---
+
+### ID — `0x01` (R)
+
+Always reads `0x74`. Use to verify device presence.
+
+```c
+#define NPZ2100_ID_EXPECTED  0x74u
+```
+
+---
+
+### STA1 — `0x02` (R) · STA2 — `0x03` (R) · STA3 — `0x04` (R)
+
+Status flags set by the device after a wake-up event.
+
+:::warning Watchdog side effect
+Reading **STA1 or STA2** resets the watchdog timer. Use this to service
+the watchdog cheaply alongside routine status reads.
+:::
+
+**STA1 fields:**
+
+| Macro | Bits | Description |
+|---|---|---|
+| `NPZ2100_STA1_RST_SRC_GET(r)` | 1:0 | System reset source (see Table 16) |
+| `NPZ2100_STA1_SRST_SRC_GET(r)` | 3:2 | Soft reset source (see Table 17) |
+| `NPZ2100_STA1_FADC1_GET(r)` | 4 | ADC ch.1 triggered |
+| `NPZ2100_STA1_FADC2_GET(r)` | 5 | ADC ch.2 triggered |
+| `NPZ2100_STA1_FADC3_GET(r)` | 6 | ADC ch.3 (battery) triggered |
+| `NPZ2100_STA1_FTOUT_GET(r)` | 7 | Time-out wake-up |
+
+**STA2 fields:**
+
+| Macro | Bits | Description |
+|---|---|---|
+| `NPZ2100_STA2_FPn_GET(r, n)` | 5:0 | Peripheral n (1–6) triggered |
+| `NPZ2100_STA2_FALM_GET(r)` | 6 | Global counter alarm triggered |
+| `NPZ2100_STA2_FLOG_GET(r)` | 7 | Log memory full |
+
+**STA3 fields:**
+
+| Macro | Bits | Description |
+|---|---|---|
+| `NPZ2100_STA3_FNAKPn_GET(r, n)` | 5:0 | Peripheral n did not ACK I²C |
+| `NPZ2100_STA3_FCNT_GET(r)` | 6 | Event counter triggered |
+| `NPZ2100_STA3_FPA_GET(r)` | 7 | Power-aware mode active |
+
+---
+
+### SYSCFG1 — `0x0A` (R/W)
+
+Enable peripherals as wake-up sources and select AND/OR wake-up logic.
+
+```c
+/* Enable peripherals 1 and 2 as wake-up sources, wake on ANY trigger */
+uint8_t cfg = NPZ2100_SYSCFG1_WUP_Pn_MSK(1)
+            | NPZ2100_SYSCFG1_WUP_Pn_MSK(2)
+            | NPZ2100_SYSCFG1_WUPMOD(0);  /* 0 = wake on any */
+npz2100_reg_write(&hal, NPZ2100_REG_SYSCFG1, cfg);
+```
+
+---
+
+### TOUT — `0x0C–0x0D` (R/W)
+
+16-bit time-out before the host is unconditionally woken up.
+Unit is system clock periods (`TOUT_EXT=0`) or 2-second steps (`TOUT_EXT=1`).
+
+:::danger
+A TOUT value below `0x0003` (`NPZ2100_TOUT_MIN_SAFE`) causes **undefined behaviour**.
+:::
+
+```c
+/* Set 60-second host wake-up time-out using 2-second increment mode */
+/* First enable TOUT_EXT in SYSCFG2 */
+npz2100_reg_rmw(&hal, NPZ2100_REG_SYSCFG2,
+                NPZ2100_SYSCFG2_TOUT_EXT_MSK,
+                NPZ2100_SYSCFG2_TOUT_EXT(1));
+
+/* Then write TOUT = 30 (30 × 2 s = 60 s) as a 16-bit little-endian value */
+uint8_t tout[2] = { 30u & 0xFFu, (30u >> 8u) & 0xFFu };
+npz2100_reg_burst_write(&hal, NPZ2100_REG_TOUT_L, tout, 2u);
+```
+
+---
+
+### GCT — `0x10–0x14` (R/W)
+
+32-bit global time counter (seconds) plus 4-bit fractional (1/16 s ticks).
+**Writing `GCT_3` (0x14) atomically latches all five bytes** — always write the
+full sequence ending with `GCT_3`.
+
+```c
+/* Set global counter to t=1000 seconds, 0 fractional */
+uint8_t gct[5] = {
+    0x00u,                         /* GCT_MS: 0 fractional ticks  */
+    (uint8_t)( 1000u & 0xFFu),    /* GCT_0 LSB                   */
+    (uint8_t)((1000u >> 8u) & 0xFFu),
+    (uint8_t)((1000u >> 16u) & 0xFFu),
+    (uint8_t)((1000u >> 24u) & 0xFFu), /* GCT_3 MSB — latches all */
+};
+npz2100_reg_burst_write(&hal, NPZ2100_REG_GCT_MS, gct, 5u);
+```
+
+---
+
+### GCTALM — `0x15–0x18` (R/W)
+
+32-bit alarm value in seconds. Triggers wake-up when `GCT == GCTALM`
+and `GTC_CFG.GTC_AEN=1`.
+
+---
+
+### WDOG — `0x19–0x1A` (R/W)
+
+16-bit watchdog timeout in 2-second units. Reset by reading STA1 or STA2.
+Enable with `GTC_CFG.WDOGEN`.
+
+---
+
+### GTC_CFG — `0x1B` (R/W)
+
+```c
+/* Enable alarm, disable watchdog */
+uint8_t gtc = NPZ2100_GTC_CFG_GTC_AEN(1) | NPZ2100_GTC_CFG_WDOGEN(0);
+npz2100_reg_write(&hal, NPZ2100_REG_GTC_CFG, gtc);
+```
+
+---
+
+### PA_CFG — `0x1C` (R/W)
+
+Power-aware mode: reduce polling rate / disable wake-ups when monitored
+signal (INT pin or ADC channel) indicates low energy available.
+
+```c
+/* Enable PA mode sourced from ADC3 (battery voltage), do not disable wake-ups */
+uint8_t pa = NPZ2100_PA_CFG_PA_EN(1)
+           | NPZ2100_PA_CFG_PA_NOWUP(0)
+           | NPZ2100_PA_CFG_PA_SRC(NPZ2100_PA_SRC_ADC3);
+npz2100_reg_write(&hal, NPZ2100_REG_PA_CFG, pa);
+```
+
+---
+
+## I/O Configuration Block — `npz2100_regs_io.h`
+
+### IOCFG1 — `0x05`
+
+Controls host power switch mode (`PSWMOD_H`) and peripheral standby states (`PSWA_S[1-4]`).
+Optional gate boost (`PSW_EN_VN`) reduces power switch Rds(on) at VBAT < 1.7 V but
+adds up to 5 µA — enable only when needed.
+
+```c
+/* Set host switch to power switch mode, peripheral 1 OFF in standby */
+uint8_t io1 = NPZ2100_IOCFG1_PSWMOD_H(NPZ2100_PSWMOD_H_POWER_SW)
+            | NPZ2100_IOCFG1_PSWA_Sn(1, 0);
+npz2100_reg_write(&hal, NPZ2100_REG_IOCFG1, io1);
+```
+
+---
+
+### IOCFG2 — `0x06`
+
+Sets mode for each peripheral power switch SW_LP[1-4] independently.
+
+```c
+/* Peripheral 1: power switch with rise detection; peripheral 2: logic output high */
+uint8_t io2 = NPZ2100_IOCFG2_PSWMOD_Sn(1, NPZ2100_PSWMOD_S_POWER_RISE)
+            | NPZ2100_IOCFG2_PSWMOD_Sn(2, NPZ2100_PSWMOD_S_LOGIC_HIGH);
+npz2100_reg_write(&hal, NPZ2100_REG_IOCFG2, io2);
+```
+
+---
+
+### IOCFG3 — `0x07`
+
+Pull-up enable and strength on INT[1-4]. Default: all enabled at ≈100 kΩ.
+
+---
+
+### IOCFG4 — `0x08`
+
+Interrupt pin direction and polarity for each INT[1-4] pin.
+
+```c
+/* INT1: input active-low; INT2: trigger output active-high */
+uint8_t io4 = NPZ2100_IOCFG4_INTMOD(1, NPZ2100_INTMOD_IN_ACTIVE_LOW)
+            | NPZ2100_IOCFG4_INTMOD(2, NPZ2100_INTMOD_OUT_ACTIVE_HIGH);
+npz2100_reg_write(&hal, NPZ2100_REG_IOCFG4, io4);
+```
+
+---
+
+### IOCFG5 — `0x09`
+
+Miscellaneous options. Defaults are energy-optimised (`SPI_AUTO=1`, `I2C_PUP_AUTO=1`).
+
+| Field | Default | Effect |
+|---|---|---|
+| `PSW_SR` | 1 | Fast PSW slew rate |
+| `IO_STR` | 0 | Normal drive strength |
+| `I2C_PUP_EN` | 1 | Internal 2 kΩ I²C pull-ups enabled |
+| `I2C_PUP_AUTO` | 1 | Auto-disable pull-ups between transactions |
+| `SPI_AUTO` | 1 | SPI outputs go HiZ when not in use |
+| `XO_SEL_CAP` | 0 | Internal XO load caps disabled |
+| `INTOUTMOD` | 0 | AND logic on shared INT output |
+
+---
+
+## Per-Peripheral Block — `npz2100_regs_periph.h`
+
+Up to 6 peripheral configurations share a banked register window at `0x20–0x2F`.
+**Always write `P_BANK` first** to select the target peripheral (0–5).
+
+```c
+/* Configure peripheral 2 (bank index 1) */
+npz2100_reg_write(&hal, NPZ2100_REG_P_BANK, NPZ2100_P_BANK(1));
+
+/* Set: I²C, periodic power, poll+read+threshold mode, 16-bit unsigned data */
+uint8_t cfgp = NPZ2100_CFGP_PWMOD(NPZ2100_PWMOD_PERIODIC)
+             | NPZ2100_CFGP_TMOD(NPZ2100_TMOD_INIT_READ_CMP);
+npz2100_reg_write(&hal, NPZ2100_REG_CFGP, cfgp);
+
+uint8_t modp = NPZ2100_MODP_DTYPE(NPZ2100_DTYPE_UINT16);
+npz2100_reg_write(&hal, NPZ2100_REG_MODP, modp);
+
+/* Set I²C address of the sensor (7-bit) */
+npz2100_reg_write(&hal, NPZ2100_REG_ADDRP, 0x48u); /* e.g. TMP117 */
+
+/* Register to read from the sensor */
+npz2100_reg_write(&hal, NPZ2100_REG_RREGP, 0x00u);
+
+/* Over-threshold: 2500 (raw), under-threshold: 0 */
+uint8_t throv[2] = { (uint8_t)(2500u & 0xFFu), (uint8_t)(2500u >> 8u) };
+uint8_t thrun[2] = { 0x00u, 0x00u };
+npz2100_reg_burst_write(&hal, NPZ2100_REG_THROVP_L, throv, 2u);
+npz2100_reg_burst_write(&hal, NPZ2100_REG_THRUNP_L, thrun, 2u);
+
+/* Polling period: e.g. 0x0200 system clock periods */
+uint8_t perp[2] = { 0x00u, 0x02u };
+npz2100_reg_burst_write(&hal, NPZ2100_REG_PERP_L, perp, 2u);
+```
+
+### Key per-peripheral registers
+
+| Register | Address | Description |
+|---|---|---|
+| `P_BANK` | `0x1F` | Bank select (0–5) |
+| `CFGP` | `0x20` | Power mode, poll mode, logging |
+| `IOP` | `0x21` | Pin assignment, PA polling rate |
+| `MODP` | `0x22` | SPI mode, data type, threshold logic |
+| `PERP` | `0x23–24` | 16-bit polling period |
+| `NCMDP` | `0x25` | Number of init commands from SRAM |
+| `ADDRP` | `0x26` | I²C address or SPI read-byte count |
+| `RREGP` | `0x27` | I²C data register address |
+| `THROVP` | `0x28–29` | 16-bit over-threshold |
+| `THRUNP` | `0x2A–2B` | 16-bit under-threshold |
+| `TWTP` | `0x2C` | Wait time (pre/post init) |
+| `TCFGP` | `0x2D` | Timing options, SPI/I²C select |
+| `VALP` | `0x2E–2F` | Last read value (read-only) |
+
+---
+
+## ADC, Logging & Event Counter — `npz2100_regs_adc_log.h`
+
+### ADC
+
+Three 8-bit ADC channels: ADC1 (external), ADC2 (external), ADC3 (battery reference).
+Enable individually via `ADCCFG`. Set over/under thresholds with `THROVAn`/`THRUNAn`.
+
+```c
+/* Enable ADC3 (battery monitoring), system clock rate */
+uint8_t adccfg = NPZ2100_ADCCFG_ADC3_EN(1)
+               | NPZ2100_ADCCFG_ADC_CLK_SEL(NPZ2100_ADC_CLK_SYSCLK);
+npz2100_reg_write(&hal, NPZ2100_REG_ADCCFG, adccfg);
+
+/* Wake up if battery ADC drops below 80 (under-threshold trigger) */
+npz2100_reg_write(&hal, NPZ2100_REG_THRUNA3, 80u);
+
+/* Enable ADC3 as wake-up source */
+npz2100_reg_rmw(&hal, NPZ2100_REG_SYSCFG2,
+                NPZ2100_SYSCFG2_WUP_ADC3_MSK,
+                (uint8_t)(1u << NPZ2100_SYSCFG2_WUP_ADC3_POS));
+```
+
+---
+
+### SRAM / Logging
+
+SRAM is 256 bytes accessible through a banked I²C window at `0x80–0xFF`.
+Select the upper or lower 128-byte bank with `SRAM_BANK`.
+
+```c
+/* Write 4 initialisation bytes into SRAM lower bank starting at offset 0x00 */
+npz2100_reg_write(&hal, NPZ2100_REG_SRAM_BANK, NPZ2100_SRAM_BANK(0));
+uint8_t init_seq[4] = { 0x10u, 0x00u, 0x20u, 0x01u }; /* (addr, val) pairs */
+npz2100_reg_burst_write(&hal, NPZ2100_SRAM_WINDOW_BASE, init_seq, 4u);
+```
+
+---
+
+### Event Counter
+
+32-bit counter sourced from any INT pin or SW_LP activation. Triggers a wake-up
+when the counter value equals `CNTTRIG`. Writing `CNTCFG.CNT_EN` resets the counter.
+
+```c
+/* Count INT1 events, wake at 100 pulses */
+uint8_t trig[4] = { 100u, 0u, 0u, 0u };
+npz2100_reg_burst_write(&hal, NPZ2100_REG_CNT_TRIG_0, trig, 4u);
+
+uint8_t cntcfg = NPZ2100_CNTCFG_CNT_SRC(NPZ2100_CNT_SRC_INT1)
+               | NPZ2100_CNTCFG_CNT_EN(1);
+npz2100_reg_write(&hal, NPZ2100_REG_CNTCFG, cntcfg);
+```

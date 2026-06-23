@@ -1,0 +1,131 @@
+---
+id: overview
+title: nPZ2100 C Driver — Overview
+sidebar_label: Overview
+sidebar_position: 1
+---
+
+# nPZ2100 C Driver
+
+The **nPZ2100** is an ultra-low-power autonomous IC from Nanopower Semiconductor AS that manages sensor
+polling, threshold comparison, and host MCU wake-up — all without host MCU involvement during normal operation.
+
+This driver provides a **platform-agnostic C API** that routes every I²C transaction through two user-supplied
+callbacks, making it portable to any MCU or RTOS.
+
+---
+
+## Key Electrical Facts Relevant to the Driver
+
+| Parameter | Value |
+|---|---|
+| Supply voltage | 1.7 – 3.6 V |
+| Idle current | 200 nA |
+| Polling current | 1.0 µA |
+| I²C frequency | 100 kHz (slave and master) |
+| SRAM | 256 bytes (two 128-byte banked windows) |
+| Peripherals managed | Up to 6 |
+
+---
+
+## File Structure
+
+```
+include/
+  npz2100.h                 ← Umbrella header (include this in your app)
+  npz2100_hal.h             ← Error type, HAL callbacks, register primitives
+  npz2100_regs_system.h     ← IDLE_RST, ID, STA1–3, SYSCFG, TOUT, GCT …
+  npz2100_regs_io.h         ← IOCFG1–5
+  npz2100_regs_periph.h     ← P_BANK, CFGP, IOP, MODP, PERP, TCFGP …
+  npz2100_regs_adc_log.h    ← ADCCFG, logging, event counter, SRAM bank
+src/
+  npz2100.c                 ← HAL primitive implementations
+```
+
+You may include only the headers you need, or use `npz2100.h` to pull in everything at once.
+
+---
+
+## Quick-Start
+
+### 1 — Implement the two HAL callbacks
+
+```c
+#include "npz2100.h"
+
+/* Example for a bare-metal I²C driver */
+static npz2100_err_t my_write(uint8_t addr, const uint8_t *buf,
+                               size_t len, void *ctx)
+{
+    /* buf[0] is the register address; buf[1..len-1] is data.
+     * Issue ONE I²C transaction: START, addr+W, buf[0..len-1], STOP. */
+    if (platform_i2c_write(addr, buf, len) != PLATFORM_OK) {
+        return NPZ2100_ERR_IO;
+    }
+    return NPZ2100_OK;
+}
+
+static npz2100_err_t my_read(uint8_t addr, uint8_t reg,
+                              uint8_t *buf, size_t len, void *ctx)
+{
+    /* Issue: START, addr+W, reg, REPEATED-START, addr+R, buf[0..len-1], STOP. */
+    if (platform_i2c_write_read(addr, &reg, 1, buf, len) != PLATFORM_OK) {
+        return NPZ2100_ERR_IO;
+    }
+    return NPZ2100_OK;
+}
+```
+
+### 2 — Populate the HAL descriptor
+
+```c
+static const npz2100_hal_t hal = {
+    .write    = my_write,
+    .read     = my_read,
+    .i2c_addr = NPZ2100_I2C_ADDR_DEFAULT,  /* 0x6F */
+    .ctx      = NULL,
+};
+```
+
+### 3 — Verify the device is present
+
+```c
+uint8_t id;
+npz2100_err_t err = npz2100_reg_read(&hal, NPZ2100_REG_ID, &id);
+if (err != NPZ2100_OK || id != NPZ2100_ID_EXPECTED) {
+    /* Device not found or I²C fault */
+}
+```
+
+### 4 — Enter idle mode
+
+```c
+/* Hand control to the nPZ2100; the host MCU can now sleep or power down. */
+npz2100_reg_write(&hal, NPZ2100_REG_IDLE_RST, NPZ2100_IDLE_RST_ENTER_IDLE);
+```
+
+---
+
+## Error Handling
+
+Every API function returns an `npz2100_err_t`:
+
+| Code | Value | Meaning |
+|---|---|---|
+| `NPZ2100_OK` | 0 | Success |
+| `NPZ2100_ERR_IO` | -1 | I²C bus error (NAK, timeout, bus fault) |
+| `NPZ2100_ERR_ARG` | -2 | Invalid argument |
+| `NPZ2100_ERR_DEV` | -3 | Device not responding / ID mismatch |
+| `NPZ2100_ERR_TIMEOUT` | -4 | Operation timed out |
+| `NPZ2100_ERR_STATE` | -5 | Wrong device state for this operation |
+
+---
+
+## I²C Efficiency Notes
+
+- **All writes** use a single I²C START/STOP pair, regardless of length. The register address is
+  prepended to the data in a stack-local buffer — no heap allocation, no extra bus transaction.
+- **Reading STA1 or STA2** resets the watchdog timer. Combine periodic status reads with watchdog
+  servicing to minimise bus activity.
+- Enable **`IOCFG5.I2C_PUP_AUTO`** (default ON) so the internal I²C pull-ups are disabled between
+  transactions, saving leakage current on the 100 kHz bus.

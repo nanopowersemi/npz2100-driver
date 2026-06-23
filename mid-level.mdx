@@ -1,0 +1,461 @@
+---
+id: mid-level
+title: Mid-Level API
+sidebar_label: Mid-Level API
+sidebar_position: 4
+---
+
+# Mid-Level API
+
+The mid-level layer sits between your application and the low-level register
+primitives. It provides three things:
+
+1. **Byte-stream regmap parsing** — consumes the flat `const uint8_t[]` produced by
+   the external register-map configuration tool.
+2. **`npz2100_config_t`** — a flat shadow struct mirroring every writable register.
+3. **Typed config helpers** — functions that encode named parameters into the shadow.
+
+The shadow diff on apply means only registers whose value has actually changed
+are written to the device — minimising I²C bus activity on every `npz2100_map_apply()` call.
+
+---
+
+## Layering diagram
+
+```
+┌─────────────────────────────────────────────┐
+│            Application code                 │
+├─────────────────────────────────────────────┤
+│   Mid-level API   (npz2100_mid.h / .c)     │
+│   • byte-stream regmap parsing              │
+│   • npz2100_config_t  — flat shadow         │
+│   • map apply / readback / diff / validate  │
+│   • typed helpers                           │
+├─────────────────────────────────────────────┤
+│   Low-level API   (npz2100_hal.h / .c)     │
+│   • reg_write / reg_read / burst / rmw     │
+├─────────────────────────────────────────────┤
+│   HAL callbacks   (user-supplied)           │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## Register map format
+
+The configuration tool does **not** produce a struct array — it produces a flat
+`const uint8_t[]` byte stream: a concatenation of variable-length segments.
+
+```
+[length] [start_addr] [data_0] [data_1] ... [data_(length-2)]
+```
+
+- **`length`** — total bytes in the segment, **including** `start_addr`. The
+  data payload is therefore `length - 1` bytes.
+- **`start_addr`** — first register address. Data bytes are written to
+  `start_addr`, `start_addr+1`, `start_addr+2`, … in order.
+
+Segments are simply concatenated with no separator or terminator — the buffer's
+total length (typically `sizeof()` on a compile-time array) tells the parser
+where the stream ends.
+
+### Example (Nanopower reference tool output)
+
+```c
+const uint8_t npz2100_regmap[] = {
+  // ---- Global configuration registers ----
+  9,          // Length (1 start_addr + 8 data... see note below)
+  0x05,       // Start address (IOCFG1 register)
+  0x00, 0x00, 0xFF, 0x00, 0x1D, 0x00, 0x00, 0xFF, 0xFF,
+
+  // ---- Peripheral 1 ----
+  15,         // Length (1 start_addr + 14 data: P_BANK..TCFGP)
+  0x1F,       // Start address (P_BANK register)
+  0x00,       // (P_BANK = peripheral slot 0)
+  0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+  // ---- Peripheral 2, 3, 4, 5, 6 follow the same 15-byte pattern ----
+};
+
+npz2100_map_apply(&hal, &shadow, npz2100_regmap, sizeof(npz2100_regmap));
+```
+
+:::caution Verify segment lengths against your tool's actual output
+`length` includes the `start_addr` byte: a segment writing registers
+`0x1F` through `0x2D` (15 registers) has `length = 15`. Always call
+`npz2100_map_validate()` once on tool output during development — it walks
+the stream and fails fast with `NPZ2100_ERR_ARG` if any segment's declared
+`length` would run past the end of the buffer, which is the most common
+hand-authoring mistake.
+:::
+
+### P_BANK requires no special handling
+
+`P_BANK` (`0x1F`) is just another addressable register in the stream. When a
+segment writes to `0x1F`, that becomes the active bank for any subsequent
+banked register addresses (`0x20`–`0x2D`) in that same or a later segment —
+exactly as it would on real hardware. The tool simply emits a `P_BANK` data
+byte before each peripheral's block, and the parser tracks it automatically
+via the shadow's `p_bank` field.
+
+---
+
+## Key types
+
+### `npz2100_config_t`
+
+The shadow — a flat struct with one `uint8_t` per writable register, plus six
+`npz2100_periph_shadow_t` sub-structs for the banked peripheral window:
+
+```c
+typedef struct {
+    uint8_t idle_rst;
+    uint8_t p_bank;      /* Tracks the currently active peripheral bank (0–5) */
+    uint8_t iocfg1, iocfg2, iocfg3, iocfg4, iocfg5;
+    uint8_t syscfg1, syscfg2;
+    uint8_t tout_l, tout_h;
+    /* GCT, GCTALM, WDOG, GTC_CFG, PA_CFG … */
+    npz2100_periph_shadow_t periph[6];  /* Slots 0–5 */
+    uint8_t adccfg, throva1, thruna1 /* … */;
+    uint8_t logcfg, logsaddr;
+    uint8_t cnt_val_0 /* … */ cnt_trig_3;
+    uint8_t sram_bank;
+} npz2100_config_t;
+```
+
+Field names match the register names in the datasheet exactly. The `p_bank`
+field has no direct datasheet equivalent in this struct form — it exists so the
+driver knows which peripheral slot's registers are currently being addressed
+when diffing `0x20`–`0x2D` against the stream.
+
+---
+
+## Typical startup sequence
+
+```c
+#include "npz2100.h"
+
+static npz2100_hal_t    hal;      /* Filled with your I²C callbacks */
+static npz2100_config_t shadow;   /* Lives for the duration of the session */
+
+/* The configuration tool's output — a flat byte stream, typically a
+ * compile-time const array generated by Nanopower's tool. */
+extern const uint8_t npz2100_regmap[];
+extern const size_t  npz2100_regmap_len;  /* or just use sizeof() directly */
+
+void app_init(void)
+{
+    /* 1. Set up the HAL. */
+    hal.write    = my_i2c_write;
+    hal.read     = my_i2c_read;
+    hal.i2c_addr = NPZ2100_I2C_ADDR_DEFAULT;
+    hal.ctx      = NULL;
+
+    /* 2. Verify the device is present. */
+    if (npz2100_probe(&hal) != NPZ2100_OK) {
+        /* handle error */
+    }
+
+    /* 3. Seed the shadow with reset defaults (no I²C). */
+    npz2100_config_init_defaults(&shadow);
+
+    /* 4. (Optional) Read the device back to sync shadow after a warm reset. */
+    npz2100_map_readback(&hal, &shadow);
+
+    /* 5. (Recommended during development) Validate the tool's output. */
+    if (npz2100_map_validate(npz2100_regmap, npz2100_regmap_len) != NPZ2100_OK) {
+        /* Malformed stream — a segment's length runs past the buffer end. */
+    }
+
+    /* 6. Log how many registers will actually change. */
+    uint8_t n = npz2100_map_diff_count(&shadow, npz2100_regmap, npz2100_regmap_len);
+    /* n == 0 means device is already in the desired state. */
+
+    /* 7. Apply — only changed registers are written. */
+    npz2100_map_apply(&hal, &shadow, npz2100_regmap, npz2100_regmap_len);
+
+    /* 8. Hand control to the nPZ2100 and let the host sleep. */
+    npz2100_enter_idle(&hal);
+}
+```
+
+For a compile-time array, `sizeof(npz2100_regmap)` can be used directly in
+place of a separately-tracked length variable:
+
+```c
+npz2100_map_apply(&hal, &shadow, npz2100_regmap, sizeof(npz2100_regmap));
+```
+
+---
+
+## Register-map functions
+
+### `npz2100_config_init_defaults`
+
+```c
+npz2100_err_t npz2100_config_init_defaults(npz2100_config_t *cfg);
+```
+
+Initialises the shadow to nPZ2100 power-on reset values. No I²C. Call once before any other mid-level function.
+
+---
+
+### `npz2100_map_validate`
+
+```c
+npz2100_err_t npz2100_map_validate(const uint8_t *map, size_t map_len);
+```
+
+Walks the byte stream checking only segment framing — does **not** touch the
+device or the shadow. Returns `NPZ2100_ERR_ARG` if any segment's declared
+`length` would read past the end of the buffer (the most common hand-authoring
+mistake). Run this once on new tool output during development.
+
+---
+
+### `npz2100_map_apply`
+
+```c
+npz2100_err_t npz2100_map_apply(const npz2100_hal_t *hal,
+                                 npz2100_config_t    *cfg,
+                                 const uint8_t        *map,
+                                 size_t                map_len);
+```
+
+Parses `map` as a sequence of `[length][start_addr][data...]` segments. For
+each resulting `(addr, value)` pair:
+- If `value == shadow field` → **skipped** (zero I²C transactions).
+- If different → one `npz2100_reg_write()` call, shadow updated.
+
+`P_BANK` (`0x1F`) requires no special handling — it is written like any other
+register in the stream, and subsequent banked addresses (`0x20`–`0x2D`) within
+the same or a later segment resolve against whatever bank was last written.
+
+---
+
+### `npz2100_map_readback`
+
+```c
+npz2100_err_t npz2100_map_readback(const npz2100_hal_t *hal,
+                                    npz2100_config_t    *cfg);
+```
+
+Reads every writable register from the device and populates the shadow. Uses
+burst reads wherever registers are consecutive to minimise bus time. Call after
+a warm reset or power-cycle to resync before the first apply.
+
+---
+
+### `npz2100_map_diff_count`
+
+```c
+uint8_t npz2100_map_diff_count(const npz2100_config_t *cfg,
+                                const uint8_t          *map,
+                                size_t                  map_len);
+```
+
+Non-destructive diff — parses the byte stream and returns the number of
+registers that would be written by `npz2100_map_apply()`, without touching
+the device or the shadow. Useful for logging or asserting before a critical apply.
+
+---
+
+### `npz2100_shadow_write_reg`
+
+```c
+npz2100_err_t npz2100_shadow_write_reg(const npz2100_hal_t *hal,
+                                        npz2100_config_t    *cfg,
+                                        uint8_t              addr,
+                                        uint8_t              value);
+```
+
+Immediate single-register write that also updates the shadow. Use for one-off
+changes that don't warrant a full map apply cycle.
+
+---
+
+## Typed configuration helpers
+
+All helpers encode named parameters into the shadow only. Call `npz2100_map_apply()`
+afterwards to push changes to the device, or use `npz2100_shadow_write_reg()` for
+immediate single-register updates.
+
+### System wake-up & timing — `npz2100_sys_set`
+
+```c
+npz2100_sys_cfg_t sys = {
+    .tout_value      = 30u,    /* 30 × 2 s = 60 s with tout_ext=true */
+    .tout_ext        = true,
+    .wup_periph_mask = (1u << 0) | (1u << 1),  /* Peripherals 1 and 2 */
+    .wup_any         = true,   /* Wake on any trigger (not all)        */
+    .wup_adc3        = true,   /* Battery ADC as additional source     */
+    .clk_xo          = false,  /* Use internal low-power RC oscillator */
+};
+npz2100_sys_set(&shadow, &sys);
+```
+
+Encodes SYSCFG1, SYSCFG2, TOUT_L, TOUT_H.
+
+---
+
+### Global timer, alarm & watchdog — `npz2100_timer_set`
+
+```c
+npz2100_timer_cfg_t timer = {
+    .gct_seconds   = 0u,      /* Reset counter to 0               */
+    .gct_ms        = 0u,
+    .alarm_seconds = 3600u,   /* Wake at T=1 hour                 */
+    .alarm_enable  = true,
+    .wdog_value    = 30u,     /* 30 × 2 s = 60 s watchdog timeout */
+    .wdog_enable   = true,
+};
+npz2100_timer_set(&shadow, &timer);
+```
+
+:::note Watchdog kick
+The watchdog is reset every time `npz2100_status_read()` is called
+(it reads STA1 and STA2). No separate "kick" command is needed.
+:::
+
+---
+
+### Power-aware mode — `npz2100_pa_set`
+
+```c
+npz2100_pa_cfg_t pa = {
+    .enable  = true,
+    .no_wup  = false,             /* Still allow wake-ups in PA mode */
+    .src     = NPZ2100_PA_SRC_ADC3, /* Battery voltage as PA source */
+};
+npz2100_pa_set(&shadow, &pa);
+```
+
+---
+
+### Peripheral configuration — `npz2100_periph_set`
+
+Configure one peripheral slot (0–5). All banked registers are encoded at once.
+
+```c
+npz2100_periph_cfg_t pcfg = {
+    /* Power and polling */
+    .pwmod       = NPZ2100_PWMOD_PERIODIC,
+    .tmod        = NPZ2100_TMOD_INIT_READ_CMP,
+    .period      = 512u,         /* Polling period in system clock periods */
+
+    /* I²C sensor */
+    .use_spi     = false,
+    .i2c_addr    = 0x48u,        /* E.g. TMP117 temperature sensor */
+    .read_reg    = 0x00u,
+    .i2c_read_only = false,
+    .i2c_retries = 1u,
+
+    /* Data */
+    .dtype        = NPZ2100_DTYPE_INT16,
+    .threshold_ov = 8000u,       /* ~+50 °C in TMP117 raw units */
+    .threshold_un = 0u,
+    .inv_cmp      = false,
+
+    /* Pin assignment (defaults for slot 0) */
+    .psw_pin = NPZ2100_IO_PIN_1,
+    .int_pin = NPZ2100_IO_PIN_1,
+    .csn_pin = NPZ2100_IO_PIN_1,
+
+    /* Logging */
+    .log_en   = true,
+    .log_ts   = true,
+    .log_freq = NPZ2100_PLOGF_EVERY_READ,
+
+    /* Timing: 5 ms post-init wait @ 400 kHz internal clock */
+    /* 5 ms = 2000 cycles; 2000 / 256 ≈ 8 → twt = 8, ext = false */
+    .twt       = 8u,
+    .twt_en    = true,
+    .twt_ext   = false,
+    .tinit_en  = false,
+};
+
+/* Write to shadow for slot 0 */
+npz2100_periph_set(&shadow, 0u, &pcfg);
+
+/* Push slot 0 to device immediately */
+npz2100_periph_apply(&hal, &shadow, 0u);
+```
+
+---
+
+### ADC — `npz2100_adc_set`
+
+```c
+npz2100_adc_cfg_t adc = {
+    .en_ch3    = true,                    /* Battery monitoring only  */
+    .clk_sel   = NPZ2100_ADC_CLK_SYSCLK,
+    .thruna    = { 0u, 0u, 80u },         /* Battery under-threshold  */
+    .throva    = { 0u, 0u, 255u },
+};
+npz2100_adc_set(&shadow, &adc);
+```
+
+---
+
+### Logging — `npz2100_log_set`
+
+```c
+npz2100_log_cfg_t log = {
+    .enable     = true,
+    .rotate     = true,   /* Ring buffer — wrap when SRAM log area full */
+    .start_addr = 0x20u,  /* Log entries start at SRAM offset 0x20     */
+};
+npz2100_log_set(&shadow, &log);
+```
+
+---
+
+### Event counter — `npz2100_counter_set`
+
+```c
+npz2100_counter_cfg_t cnt = {
+    .enable  = true,
+    .src     = NPZ2100_CNT_SRC_INT1,
+    .trigger = 100u,   /* Wake host after 100 pulses on INT1 */
+};
+npz2100_counter_set(&shadow, &cnt);
+```
+
+---
+
+## Device control helpers
+
+| Function | Description |
+|---|---|
+| `npz2100_probe(&hal)` | Verify ID register = 0x74 |
+| `npz2100_status_read(&hal, &sta1, &sta2, &sta3)` | Read all 3 status bytes in one burst; resets watchdog |
+| `npz2100_periph_read_value(&hal, &shadow, slot, &val)` | Read VALP for one peripheral; manages P_BANK |
+| `npz2100_adc_read(&hal, &ch1, &ch2, &ch3)` | Read VAL_ADC1–3 in one burst |
+| `npz2100_sram_write(&hal, &shadow, addr, data, len)` | Write to SRAM; auto bank-switches at 128-byte boundary |
+| `npz2100_sram_read(&hal, &shadow, addr, data, len)` | Read from SRAM; auto bank-switches |
+| `npz2100_enter_idle(&hal)` | Send idle command — hand control to nPZ2100 |
+| `npz2100_soft_reset(&hal)` | Soft reset (SRAM preserved) |
+
+---
+
+## Integration with the configuration tool
+
+The tool produces one flat `const uint8_t[]` byte stream — a concatenation of
+`[length][start_addr][data...]` segments (see "Register map format" above).
+Each segment writes one contiguous block of registers; a typical tool output
+has one segment for the global configuration block and one 15-byte segment
+per peripheral slot (`P_BANK` + `CFGP`…`TCFGP`).
+
+`npz2100_map_apply()` parses the stream and tracks `P_BANK` through the
+shadow's `p_bank` field exactly like any other register — no special framing
+or lookahead is required from the tool. The tool only needs to emit a `P_BANK`
+data byte (as part of a segment starting at `0x1F`) before each peripheral's
+block, which is the natural way to express "select this peripheral, then
+configure it."
+
+:::tip Sanity-check new tool output
+Call `npz2100_map_validate()` once when integrating a new or updated tool
+version. It catches the most common authoring mistake — a segment's `length`
+byte not matching the actual number of bytes that follow — before any I²C
+transaction is attempted.
+:::
