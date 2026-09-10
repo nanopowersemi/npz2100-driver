@@ -99,7 +99,7 @@ static npz2100_err_t my_i2c_read(uint8_t  i2c_addr,
 npz2100_hal_t hal = {
     .write    = my_i2c_write,
     .read     = my_i2c_read,
-    .i2c_addr = 0x6F,    /* 7-bit address — factory default */
+    .i2c_addr = 0x3C,    /* 7-bit address — factory default */
     .ctx      = NULL,    /* passed through to every callback */
 };
 ```
@@ -149,7 +149,7 @@ typedef enum {
 typedef struct {
     npz2100_i2c_write_fn  write;     /* I2C write callback (user-supplied) */
     npz2100_i2c_read_fn   read;      /* I2C read callback  (user-supplied) */
-    uint8_t               i2c_addr;  /* 7-bit I2C address (default: 0x6F)  */
+    uint8_t               i2c_addr;  /* 7-bit I2C address (default: 0x3C)  */
     void                 *ctx;       /* Passed to every callback            */
 } npz2100_hal_t;
 ```
